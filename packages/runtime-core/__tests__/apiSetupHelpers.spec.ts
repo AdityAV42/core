@@ -1,5 +1,8 @@
 import {
-  ComponentInternalInstance,
+  type ComponentInternalInstance,
+  type SetupContext,
+  Suspense,
+  computed,
   createApp,
   defineComponent,
   getCurrentInstance,
@@ -8,21 +11,22 @@ import {
   onMounted,
   render,
   serializeInner,
-  SetupContext,
-  Suspense,
-  computed,
-  ComputedRef
+  shallowReactive,
 } from '@vue/runtime-test'
 import {
+  createPropsRestProxy,
   defineEmits,
-  defineProps,
   defineExpose,
-  withDefaults,
+  defineProps,
+  mergeDefaults,
+  mergeModels,
   useAttrs,
   useSlots,
-  mergeDefaults,
-  withAsyncContext
+  withAsyncContext,
+  withDefaults,
 } from '../src/apiSetupHelpers'
+import type { ComputedRefImpl } from '../../reactivity/src/computed'
+import { EffectFlags, type ReactiveEffectRunner, effect } from '@vue/reactivity'
 
 describe('SFC <script setup> helpers', () => {
   test('should warn runtime usage', () => {
@@ -47,12 +51,12 @@ describe('SFC <script setup> helpers', () => {
         slots = useSlots()
         attrs = useAttrs()
         return () => {}
-      }
+      },
     }
     const passedAttrs = { id: 'foo' }
     const passedSlots = {
       default: () => {},
-      x: () => {}
+      x: () => {},
     }
     render(h(Comp, passedAttrs, passedSlots), nodeOps.createElement('div'))
     expect(typeof slots!.default).toBe('function')
@@ -70,33 +74,121 @@ describe('SFC <script setup> helpers', () => {
         attrs = useAttrs()
         ctx = _ctx
         return () => {}
-      }
+      },
     })
     render(h(Comp), nodeOps.createElement('div'))
     expect(slots).toBe(ctx!.slots)
     expect(attrs).toBe(ctx!.attrs)
   })
 
-  test('mergeDefaults', () => {
-    const merged = mergeDefaults(
-      {
-        foo: null,
-        bar: { type: String, required: false }
-      },
-      {
-        foo: 1,
-        bar: 'baz'
-      }
-    )
-    expect(merged).toMatchObject({
-      foo: { default: 1 },
-      bar: { type: String, required: false, default: 'baz' }
+  describe('mergeDefaults', () => {
+    test('object syntax', () => {
+      const merged = mergeDefaults(
+        {
+          foo: null,
+          bar: { type: String, required: false },
+          baz: String,
+        },
+        {
+          foo: 1,
+          bar: 'baz',
+          baz: 'qux',
+        },
+      )
+      expect(merged).toMatchObject({
+        foo: { default: 1 },
+        bar: { type: String, required: false, default: 'baz' },
+        baz: { type: String, default: 'qux' },
+      })
     })
 
-    mergeDefaults({}, { foo: 1 })
-    expect(
-      `props default key "foo" has no corresponding declaration`
-    ).toHaveBeenWarned()
+    test('array syntax', () => {
+      const merged = mergeDefaults(['foo', 'bar', 'baz'], {
+        foo: 1,
+        bar: 'baz',
+        baz: 'qux',
+      })
+      expect(merged).toMatchObject({
+        foo: { default: 1 },
+        bar: { default: 'baz' },
+        baz: { default: 'qux' },
+      })
+    })
+
+    test('merging with skipFactory', () => {
+      const fn = () => {}
+      const merged = mergeDefaults(['foo', 'bar', 'baz'], {
+        foo: fn,
+        __skip_foo: true,
+      })
+      expect(merged).toMatchObject({
+        foo: { default: fn, skipFactory: true },
+      })
+    })
+
+    test('should warn missing', () => {
+      mergeDefaults({}, { foo: 1 })
+      expect(
+        `props default key "foo" has no corresponding declaration`,
+      ).toHaveBeenWarned()
+    })
+  })
+
+  describe('mergeModels', () => {
+    test('array syntax', () => {
+      expect(mergeModels(['foo', 'bar'], ['baz'])).toMatchObject([
+        'foo',
+        'bar',
+        'baz',
+      ])
+    })
+
+    test('object syntax', () => {
+      expect(
+        mergeModels({ foo: null, bar: { required: true } }, ['baz']),
+      ).toMatchObject({
+        foo: null,
+        bar: { required: true },
+        baz: {},
+      })
+
+      expect(
+        mergeModels(['baz'], { foo: null, bar: { required: true } }),
+      ).toMatchObject({
+        foo: null,
+        bar: { required: true },
+        baz: {},
+      })
+    })
+
+    test('overwrite', () => {
+      expect(
+        mergeModels(
+          { foo: null, bar: { required: true } },
+          { bar: {}, baz: {} },
+        ),
+      ).toMatchObject({
+        foo: null,
+        bar: {},
+        baz: {},
+      })
+    })
+  })
+
+  test('createPropsRestProxy', () => {
+    const original = shallowReactive({
+      foo: 1,
+      bar: 2,
+      baz: 3,
+    })
+    const rest = createPropsRestProxy(original, ['foo', 'bar'])
+    expect('foo' in rest).toBe(false)
+    expect('bar' in rest).toBe(false)
+    expect(rest.baz).toBe(3)
+    expect(Object.keys(rest)).toEqual(['baz'])
+
+    original.baz = 4
+    expect(rest.baz).toBe(4)
   })
 
   describe('withAsyncContext', () => {
@@ -111,7 +203,7 @@ describe('SFC <script setup> helpers', () => {
     })
 
     test('basic', async () => {
-      const spy = jest.fn()
+      const spy = vi.fn()
 
       let beforeInstance: ComponentInternalInstance | null = null
       let afterInstance: ComponentInternalInstance | null = null
@@ -123,25 +215,29 @@ describe('SFC <script setup> helpers', () => {
 
           beforeInstance = getCurrentInstance()
 
-          const msg = (([__temp, __restore] = withAsyncContext(
-            () =>
-              new Promise(r => {
-                resolve = r
-              })
-          )),
-          (__temp = await __temp),
-          __restore(),
-          __temp)
+          const msg =
+            (([__temp, __restore] = withAsyncContext(
+              () =>
+                new Promise(r => {
+                  resolve = r
+                }),
+            )),
+            (__temp = await __temp),
+            __restore(),
+            __temp)
 
           // register the lifecycle after an await statement
           onMounted(spy)
           afterInstance = getCurrentInstance()
           return () => msg
-        }
+        },
       })
 
       const root = nodeOps.createElement('div')
-      render(h(() => h(Suspense, () => h(Comp))), root)
+      render(
+        h(() => h(Suspense, () => h(Comp))),
+        root,
+      )
 
       expect(spy).not.toHaveBeenCalled()
       resolve!('hello')
@@ -155,7 +251,7 @@ describe('SFC <script setup> helpers', () => {
     })
 
     test('error handling', async () => {
-      const spy = jest.fn()
+      const spy = vi.fn()
 
       let beforeInstance: ComponentInternalInstance | null = null
       let afterInstance: ComponentInternalInstance | null = null
@@ -171,22 +267,25 @@ describe('SFC <script setup> helpers', () => {
               () =>
                 new Promise((_, rj) => {
                   reject = rj
-                })
+                }),
             )
             __temp = await __temp
             __restore()
-          } catch (e) {
+          } catch (e: any) {
             // ignore
           }
           // register the lifecycle after an await statement
           onMounted(spy)
           afterInstance = getCurrentInstance()
           return () => ''
-        }
+        },
       })
 
       const root = nodeOps.createElement('div')
-      render(h(() => h(Suspense, () => h(Comp))), root)
+      render(
+        h(() => h(Suspense, () => h(Comp))),
+        root,
+      )
 
       expect(spy).not.toHaveBeenCalled()
       reject!()
@@ -238,11 +337,14 @@ describe('SFC <script setup> helpers', () => {
             resolve()
             return ''
           }
-        }
+        },
       })
 
       const root = nodeOps.createElement('div')
-      render(h(() => h(Suspense, () => h(Comp))), root)
+      render(
+        h(() => h(Suspense, () => h(Comp))),
+        root,
+      )
 
       await ready
       expect(inBandInstance).toBe(beforeInstance)
@@ -267,7 +369,7 @@ describe('SFC <script setup> helpers', () => {
           __temp = await __temp
           __restore()
         },
-        render() {}
+        render() {},
       })
 
       const app = createApp(() => h(Suspense, () => h(Comp)))
@@ -287,7 +389,7 @@ describe('SFC <script setup> helpers', () => {
     test('race conditions', async () => {
       const uids = {
         one: { before: NaN, after: NaN },
-        two: { before: NaN, after: NaN }
+        two: { before: NaN, after: NaN },
       }
 
       const Comp = defineComponent({
@@ -302,13 +404,13 @@ describe('SFC <script setup> helpers', () => {
 
           uids[props.name].after = getCurrentInstance()!.uid
           return () => ''
-        }
+        },
       })
 
       const app = createApp(() =>
         h(Suspense, () =>
-          h('div', [h(Comp, { name: 'one' }), h(Comp, { name: 'two' })])
-        )
+          h('div', [h(Comp, { name: 'one' }), h(Comp, { name: 'two' })]),
+        ),
       )
       const root = nodeOps.createElement('div')
       app.mount(root)
@@ -325,7 +427,8 @@ describe('SFC <script setup> helpers', () => {
         resolve = r
       })
 
-      let c: ComputedRef
+      let c: ComputedRefImpl
+      let e: ReactiveEffectRunner
 
       const Comp = defineComponent({
         async setup() {
@@ -334,11 +437,12 @@ describe('SFC <script setup> helpers', () => {
           __temp = await __temp
           __restore()
 
-          c = computed(() => {})
+          c = computed(() => {}) as unknown as ComputedRefImpl
+          e = effect(() => c.value)
           // register the lifecycle after an await statement
           onMounted(resolve)
-          return () => ''
-        }
+          return () => c.value
+        },
       })
 
       const app = createApp(() => h(Suspense, () => h(Comp)))
@@ -346,10 +450,12 @@ describe('SFC <script setup> helpers', () => {
       app.mount(root)
 
       await ready
-      expect(c!.effect.active).toBe(true)
+      expect(e!.effect.flags & EffectFlags.ACTIVE).toBeTruthy()
+      expect(c!.flags & EffectFlags.TRACKING).toBeTruthy()
 
       app.unmount()
-      expect(c!.effect.active).toBe(false)
+      expect(e!.effect.flags & EffectFlags.ACTIVE).toBeFalsy()
+      expect(c!.flags & EffectFlags.TRACKING).toBeFalsy()
     })
   })
 })

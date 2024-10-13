@@ -1,29 +1,40 @@
-import { currentBlock, isBlockTreeEnabled, VNode } from '../vnode'
+import { hasChanged } from '@vue/shared'
+import { type VNode, currentBlock, isBlockTreeEnabled } from '../vnode'
 
 export function withMemo(
   memo: any[],
   render: () => VNode<any, any>,
   cache: any[],
-  index: number
-) {
+  index: number,
+): VNode<any, any> {
   const cached = cache[index] as VNode | undefined
-  if (cached && isMemoSame(cached.memo!, memo)) {
-    // make sure to let parent block track it when returning cached
-    if (isBlockTreeEnabled > 0 && currentBlock) {
-      currentBlock.push(cached)
-    }
+  if (cached && isMemoSame(cached, memo)) {
     return cached
   }
   const ret = render()
-  ret.memo = memo
+
+  // shallow clone
+  ret.memo = memo.slice()
+  ret.cacheIndex = index
+
   return (cache[index] = ret)
 }
 
-export function isMemoSame(prev: any[], next: any[]) {
+export function isMemoSame(cached: VNode, memo: any[]): boolean {
+  const prev: any[] = cached.memo!
+  if (prev.length != memo.length) {
+    return false
+  }
+
   for (let i = 0; i < prev.length; i++) {
-    if (prev[i] !== next[i]) {
+    if (hasChanged(prev[i], memo[i])) {
       return false
     }
+  }
+
+  // make sure to let parent block track it when returning cached
+  if (isBlockTreeEnabled > 0 && currentBlock) {
+    currentBlock.push(cached)
   }
   return true
 }

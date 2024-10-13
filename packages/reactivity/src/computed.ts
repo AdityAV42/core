@@ -1,142 +1,219 @@
-import { DebuggerOptions, ReactiveEffect } from './effect'
-import { Ref, trackRefValue, triggerRefValue } from './ref'
-import { isFunction, NOOP } from '@vue/shared'
-import { ReactiveFlags, toRaw } from './reactive'
-import { Dep } from './dep'
+import { isFunction } from '@vue/shared'
+import {
+  type DebuggerEvent,
+  type DebuggerOptions,
+  EffectFlags,
+  type Subscriber,
+  activeSub,
+  batch,
+  refreshComputed,
+} from './effect'
+import type { Ref } from './ref'
+import { warn } from './warning'
+import { Dep, type Link, globalVersion } from './dep'
+import { ReactiveFlags, TrackOpTypes } from './constants'
 
-export interface ComputedRef<T = any> extends WritableComputedRef<T> {
+declare const ComputedRefSymbol: unique symbol
+declare const WritableComputedRefSymbol: unique symbol
+
+interface BaseComputedRef<T, S = T> extends Ref<T, S> {
+  [ComputedRefSymbol]: true
+  /**
+   * @deprecated computed no longer uses effect
+   */
+  effect: ComputedRefImpl
+}
+
+export interface ComputedRef<T = any> extends BaseComputedRef<T> {
   readonly value: T
 }
 
-export interface WritableComputedRef<T> extends Ref<T> {
-  readonly effect: ReactiveEffect<T>
+export interface WritableComputedRef<T, S = T> extends BaseComputedRef<T, S> {
+  [WritableComputedRefSymbol]: true
 }
 
-export type ComputedGetter<T> = (ctx?: any) => T
-export type ComputedSetter<T> = (v: T) => void
+export type ComputedGetter<T> = (oldValue?: T) => T
+export type ComputedSetter<T> = (newValue: T) => void
 
-export interface WritableComputedOptions<T> {
+export interface WritableComputedOptions<T, S = T> {
   get: ComputedGetter<T>
-  set: ComputedSetter<T>
+  set: ComputedSetter<S>
 }
-
-type ComputedScheduler = (fn: () => void) => void
-let scheduler: ComputedScheduler | undefined
 
 /**
- * Set a scheduler for deferring computed computations
+ * @private exported by @vue/reactivity for Vue core use, but not exported from
+ * the main vue package
  */
-export const setComputedScheduler = (s: ComputedScheduler | undefined) => {
-  scheduler = s
-}
+export class ComputedRefImpl<T = any> implements Subscriber {
+  /**
+   * @internal
+   */
+  _value: any = undefined
+  /**
+   * @internal
+   */
+  readonly dep: Dep = new Dep(this)
+  /**
+   * @internal
+   */
+  readonly __v_isRef = true
+  // TODO isolatedDeclarations ReactiveFlags.IS_REF
+  /**
+   * @internal
+   */
+  readonly __v_isReadonly: boolean
+  // TODO isolatedDeclarations ReactiveFlags.IS_READONLY
+  // A computed is also a subscriber that tracks other deps
+  /**
+   * @internal
+   */
+  deps?: Link = undefined
+  /**
+   * @internal
+   */
+  depsTail?: Link = undefined
+  /**
+   * @internal
+   */
+  flags: EffectFlags = EffectFlags.DIRTY
+  /**
+   * @internal
+   */
+  globalVersion: number = globalVersion - 1
+  /**
+   * @internal
+   */
+  isSSR: boolean
+  /**
+   * @internal
+   */
+  next?: Subscriber = undefined
 
-class ComputedRefImpl<T> {
-  public dep?: Dep = undefined
+  // for backwards compat
+  effect: this = this
+  // dev only
+  onTrack?: (event: DebuggerEvent) => void
+  // dev only
+  onTrigger?: (event: DebuggerEvent) => void
 
-  private _value!: T
-  private _dirty = true
-  public readonly effect: ReactiveEffect<T>
-
-  public readonly __v_isRef = true;
-  public readonly [ReactiveFlags.IS_READONLY]: boolean
+  /**
+   * Dev only
+   * @internal
+   */
+  _warnRecursive?: boolean
 
   constructor(
-    getter: ComputedGetter<T>,
-    private readonly _setter: ComputedSetter<T>,
-    isReadonly: boolean
+    public fn: ComputedGetter<T>,
+    private readonly setter: ComputedSetter<T> | undefined,
+    isSSR: boolean,
   ) {
-    let compareTarget: any
-    let hasCompareTarget = false
-    let scheduled = false
-    this.effect = new ReactiveEffect(getter, (computedTrigger?: boolean) => {
-      if (scheduler && this.dep) {
-        if (computedTrigger) {
-          compareTarget = this._value
-          hasCompareTarget = true
-        } else if (!scheduled) {
-          const valueToCompare = hasCompareTarget ? compareTarget : this._value
-          scheduled = true
-          hasCompareTarget = false
-          scheduler(() => {
-            if (this._get() !== valueToCompare) {
-              triggerRefValue(this)
-            }
-            scheduled = false
-          })
-        }
-        // chained upstream computeds are notified synchronously to ensure
-        // value invalidation in case of sync access; normal effects are
-        // deferred to be triggered in scheduler.
-        for (const e of this.dep) {
-          if (e.computed) {
-            e.scheduler!(true /* computedTrigger */)
-          }
-        }
-      }
-      if (!this._dirty) {
-        this._dirty = true
-        if (!scheduler) triggerRefValue(this)
-      }
-    })
-    this.effect.computed = true
-    this[ReactiveFlags.IS_READONLY] = isReadonly
+    this[ReactiveFlags.IS_READONLY] = !setter
+    this.isSSR = isSSR
   }
 
-  private _get() {
-    if (this._dirty) {
-      this._dirty = false
-      return (this._value = this.effect.run()!)
+  /**
+   * @internal
+   */
+  notify(): true | void {
+    this.flags |= EffectFlags.DIRTY
+    if (
+      !(this.flags & EffectFlags.NOTIFIED) &&
+      // avoid infinite self recursion
+      activeSub !== this
+    ) {
+      batch(this, true)
+      return true
+    } else if (__DEV__) {
+      // TODO warn
+    }
+  }
+
+  get value(): T {
+    const link = __DEV__
+      ? this.dep.track({
+          target: this,
+          type: TrackOpTypes.GET,
+          key: 'value',
+        })
+      : this.dep.track()
+    refreshComputed(this)
+    // sync version after evaluation
+    if (link) {
+      link.version = this.dep.version
     }
     return this._value
   }
 
-  get value() {
-    trackRefValue(this)
-    // the computed ref may get wrapped by other proxies e.g. readonly() #3376
-    return toRaw(this)._get()
-  }
-
-  set value(newValue: T) {
-    this._setter(newValue)
+  set value(newValue) {
+    if (this.setter) {
+      this.setter(newValue)
+    } else if (__DEV__) {
+      warn('Write operation failed: computed value is readonly')
+    }
   }
 }
 
+/**
+ * Takes a getter function and returns a readonly reactive ref object for the
+ * returned value from the getter. It can also take an object with get and set
+ * functions to create a writable ref object.
+ *
+ * @example
+ * ```js
+ * // Creating a readonly computed ref:
+ * const count = ref(1)
+ * const plusOne = computed(() => count.value + 1)
+ *
+ * console.log(plusOne.value) // 2
+ * plusOne.value++ // error
+ * ```
+ *
+ * ```js
+ * // Creating a writable computed ref:
+ * const count = ref(1)
+ * const plusOne = computed({
+ *   get: () => count.value + 1,
+ *   set: (val) => {
+ *     count.value = val - 1
+ *   }
+ * })
+ *
+ * plusOne.value = 1
+ * console.log(count.value) // 0
+ * ```
+ *
+ * @param getter - Function that produces the next value.
+ * @param debugOptions - For debugging. See {@link https://vuejs.org/guide/extras/reactivity-in-depth.html#computed-debugging}.
+ * @see {@link https://vuejs.org/api/reactivity-core.html#computed}
+ */
 export function computed<T>(
   getter: ComputedGetter<T>,
-  debugOptions?: DebuggerOptions
+  debugOptions?: DebuggerOptions,
 ): ComputedRef<T>
-export function computed<T>(
-  options: WritableComputedOptions<T>,
-  debugOptions?: DebuggerOptions
-): WritableComputedRef<T>
+export function computed<T, S = T>(
+  options: WritableComputedOptions<T, S>,
+  debugOptions?: DebuggerOptions,
+): WritableComputedRef<T, S>
 export function computed<T>(
   getterOrOptions: ComputedGetter<T> | WritableComputedOptions<T>,
-  debugOptions?: DebuggerOptions
+  debugOptions?: DebuggerOptions,
+  isSSR = false,
 ) {
   let getter: ComputedGetter<T>
-  let setter: ComputedSetter<T>
+  let setter: ComputedSetter<T> | undefined
 
   if (isFunction(getterOrOptions)) {
     getter = getterOrOptions
-    setter = __DEV__
-      ? () => {
-          console.warn('Write operation failed: computed value is readonly')
-        }
-      : NOOP
   } else {
     getter = getterOrOptions.get
     setter = getterOrOptions.set
   }
 
-  const cRef = new ComputedRefImpl(
-    getter,
-    setter,
-    isFunction(getterOrOptions) || !getterOrOptions.set
-  )
+  const cRef = new ComputedRefImpl(getter, setter, isSSR)
 
-  if (__DEV__ && debugOptions) {
-    cRef.effect.onTrack = debugOptions.onTrack
-    cRef.effect.onTrigger = debugOptions.onTrigger
+  if (__DEV__ && debugOptions && !isSSR) {
+    cRef.onTrack = debugOptions.onTrack
+    cRef.onTrigger = debugOptions.onTrigger
   }
 
   return cRef as any
